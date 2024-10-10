@@ -1,0 +1,72 @@
+import pandas as pd
+import s3fs
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
+import json
+import boto3
+
+!pip install s3fs
+!pip install snowflake-connector-python
+!pip install keyring==23.11.0
+!pip install textdistance
+
+# For Individual Files
+#df=pd.read_json('s3://klickly-ard-production/topics/klickly.ui.data/year=2024/month=10/day=08/hour=00/',lines=True)
+#InteractiveShell.ast_node_interactivity = "all"
+#pd.set_option('display.max_rows', 500)
+#pd.set_option('display.max_colwidth', None)
+#pd.set_option('display.max_columns', 100)
+
+# Read Snowflake credentials
+with open('snowflake_creds.json', 'r') as f:
+    kwargs = json.load(f)
+
+# Connect to Snowflake
+conn = snowflake.connector.connect(**kwargs)
+
+# Specify S3 bucket and base path
+bucket_name = 'klickly-ard-production'
+base_path = 'topics/klickly.ui.data/year=2024/month=10/day=08/'
+
+# Initialize boto3 to interact with S3
+s3 = boto3.client('s3')
+
+# Fetch the list of all folders within the base path
+response = s3.list_objects_v2(Bucket=bucket_name, Prefix=base_path, Delimiter='/')
+
+# Extract all folder paths from the response
+folders = [content['Prefix'] for content in response.get('CommonPrefixes', [])]
+
+# Process and upload data from each folder individually to avoid memory overload
+for folder in folders:
+    # Fetch files in the current folder
+    folder_objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=folder)['Contents']
+    
+    for obj in folder_objects:
+        file_path = obj['Key']
+        
+        try:
+            # Read the JSON file from S3
+            df = pd.read_json(f's3://{bucket_name}/{file_path}', lines=True)
+
+            # Keep only the columns of interest
+            columns_to_keep = ['screen', 'adId', 'touch']
+            df_filtered = df[columns_to_keep]
+
+            # Upload this chunk of data to Snowflake
+            success, nchunks, nrows, _ = write_pandas(conn=conn,
+                                                      df=df_filtered,
+                                                      table_name='ImportTesting',
+                                                      chunk_size=5000,
+                                                      schema='DS_KLICKLY_ANALYTICS_INFO',
+                                                      database='DATALAKE_PRODUCTION',
+                                                      parallel=1,
+                                                      auto_create_table=True)
+
+            if success:
+                print(f"Successfully uploaded {nrows} rows from {file_path}.")
+            else:
+                print(f"Upload from {file_path} to Snowflake failed.")
+
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
